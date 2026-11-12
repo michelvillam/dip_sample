@@ -1,9 +1,5 @@
-import { auditLogger } from '../infra/audit-logger.ts'
-import { isFeatureEnabled } from '../infra/feature-flags.ts'
-import { PasswordHasher } from '../infra/password-hasher.ts'
-import { PostgresUserRepository } from '../infra/postgres-user-repository.ts'
-import { SmtpEmailSender } from '../infra/smtp-email-sender.ts'
 import type { RegistrationInput, RegistrationResult, StoredUser } from '../types.ts'
+import type { RegistrationDependencies } from './ports.ts'
 
 const TOKEN_LIFETIME_MS = 24 * 60 * 60 * 1000
 
@@ -13,9 +9,7 @@ const TOKEN_LIFETIME_MS = 24 * 60 * 60 * 1000
  * pincha en el enlace.
  */
 export class UserRegistrationService {
-  private readonly repository = new PostgresUserRepository()
-  private readonly emailSender = new SmtpEmailSender()
-  private readonly passwordHasher = new PasswordHasher()
+  constructor(private readonly dependencies: RegistrationDependencies) {}
 
   register(input: RegistrationInput): RegistrationResult {
     if (!input.email.includes('@')) {
@@ -24,37 +18,39 @@ export class UserRegistrationService {
     if (input.password.length < 8) {
       throw new Error('La contraseña debe tener al menos 8 caracteres')
     }
-    if (this.repository.findByEmail(input.email) !== null) {
-      auditLogger.warn(`Intento de alta duplicada: ${input.email}`)
+    if (this.dependencies.repository.findByEmail(input.email) !== null) {
+      this.dependencies.auditLogger.warn(`Intento de alta duplicada: ${input.email}`)
       throw new Error(`Ya existe una cuenta con el email ${input.email}`)
     }
 
-    const now = new Date()
-    const token = Math.random().toString(36).slice(2, 10).toUpperCase()
+    const now = this.dependencies.clock.now()
+    const token = this.dependencies.tokenGenerator.generate()
 
     const user: StoredUser = {
-      id: `usr_${now.getTime()}_${Math.floor(Math.random() * 1000)}`,
+      id: this.dependencies.idGenerator.generate(),
       email: input.email,
       fullName: input.fullName,
       country: input.country,
-      passwordHash: this.passwordHasher.hash(input.password),
+      passwordHash: this.dependencies.passwordHasher.hash(input.password),
       confirmationToken: token,
-      tokenExpiresAt: new Date(now.getTime() + TOKEN_LIFETIME_MS).toISOString(),
+      tokenExpiresAt: this.dependencies.clock
+        .addMilliseconds(now, TOKEN_LIFETIME_MS)
+        .toISOString(),
       status: 'pending',
       createdAt: now.toISOString(),
     }
 
-    this.repository.insert(user)
+    this.dependencies.repository.insert(user)
 
-    if (isFeatureEnabled('WELCOME_EMAIL')) {
-      this.emailSender.send(
+    if (this.dependencies.featureFlags.isEnabled('WELCOME_EMAIL')) {
+      this.dependencies.notificationSender.send(
         user.email,
         'Confirma tu cuenta en OfiDocs',
         `Hola ${user.fullName}, confirma tu cuenta con este código: ${token}`,
       )
     }
 
-    auditLogger.info(`Usuario registrado: ${user.id}`)
+    this.dependencies.auditLogger.info(`Usuario registrado: ${user.id}`)
 
     return {
       userId: user.id,
@@ -64,18 +60,18 @@ export class UserRegistrationService {
   }
 
   confirm(token: string): StoredUser {
-    const user = this.repository.findByToken(token)
+    const user = this.dependencies.repository.findByToken(token)
     if (user === null) {
       throw new Error('Código de confirmación desconocido')
     }
-    if (new Date(user.tokenExpiresAt).getTime() < Date.now()) {
-      auditLogger.warn(`Código caducado para ${user.email}`)
+    if (user.tokenExpiresAt < this.dependencies.clock.now().toISOString()) {
+      this.dependencies.auditLogger.warn(`Código caducado para ${user.email}`)
       throw new Error('El código de confirmación ha caducado')
     }
 
     const activated: StoredUser = { ...user, status: 'active' }
-    this.repository.update(activated)
-    auditLogger.info(`Usuario activado: ${user.id}`)
+    this.dependencies.repository.update(activated)
+    this.dependencies.auditLogger.info(`Usuario activado: ${user.id}`)
 
     return activated
   }
